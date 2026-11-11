@@ -16,7 +16,7 @@ import java.util.regex.Pattern;
  * previous payment without you paying them in between. The tag is display-only; nothing is sent anywhere.
  *
  *   "name paid you $ amount"  -> money received (and an auction bid while an auction runs)
- *   "You paid name $ amount"  -> money sent
+ *   "You paid name $ amount (+$ tax tax)" -> money sent; the tax is part of what you lost (the "(+$ tax tax)" part is optional)
  *   "$ amount" alone          -> money from selling
  *   "You bought N item for $ amount" -> subtracts from live profit (not a win/loss/gamble)
  *
@@ -32,7 +32,9 @@ public final class PaymentChat {
     // "$ 1,500", "$1,500", "$ 2.5m" are all accepted
     private static final String AMT = "\\$\\s*([0-9][0-9,]*(?:\\.[0-9]+)?[kKmMbBtT]?)";
     private static final Pattern RECEIVED = Pattern.compile("^\\s*([A-Za-z0-9_.]{1,16}) paid you " + AMT);
-    private static final Pattern SENT = Pattern.compile("^\\s*You paid ([A-Za-z0-9_.]{1,16}) " + AMT);
+    // "You paid Name $5M (+$250K tax)": group 1 = name, 2 = amount, 3 = tax (null when the message has no tax part)
+    private static final Pattern SENT = Pattern.compile(
+            "^\\s*You paid ([A-Za-z0-9_.]{1,16}) " + AMT + "(?:\\s*\\(\\s*\\+?\\s*" + AMT + "\\s*(?i:tax)\\s*\\)?)?");
     private static final Pattern BOUGHT = Pattern.compile("(?i)^\\s*You bought\\s+([0-9][0-9,]*)\\s+(.+?)\\s+for\\s+" + AMT);
     private static final Pattern SELL_ONLY = Pattern.compile("^\\s*\\+?\\s*" + AMT + "\\s*$");
     private static final Pattern SELL_TEXT = Pattern.compile("(?i)^\\s*(?:you\\s+)?sold\\b.*?" + AMT);
@@ -82,7 +84,8 @@ public final class PaymentChat {
         m = SENT.matcher(plain);
         if (m.find()) {
             long amount = parse(m.group(2));
-            if (amount >= MIN_PAYMENT) Actions.record(Session.OUT, m.group(1), amount);
+            long tax = m.group(3) == null ? 0 : parse(m.group(3));
+            if (amount >= MIN_PAYMENT) Actions.record(Session.OUT, m.group(1), amount, tax);
             return message;
         }
 
