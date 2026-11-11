@@ -12,6 +12,7 @@ import net.minecraft.text.MutableText;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 
+import java.time.LocalDate;
 import java.util.List;
 
 /**
@@ -67,8 +68,13 @@ public final class Actions {
 
     /** Called for every payment / sale message read from chat (and by /ds in|out|sell). */
     public static void record(String kind, String who, long amount) {
+        record(kind, who, amount, 0);
+    }
+
+    /** Same as above, with the tax that was charged on top of a payment you sent. */
+    public static void record(String kind, String who, long amount, long tax) {
         Session s = s();
-        Session.Entry e = s.add(kind, who, amount);
+        Session.Entry e = s.add(kind, who, amount, tax);
         s.save();
         s.logCsv(kind, e.who, e.amount, s.delta(e));
         if (s.sound && Session.IN.equals(kind)) {
@@ -95,17 +101,83 @@ public final class Actions {
         long now = System.currentTimeMillis();
         if (now <= resetArmedUntil) {
             resetArmedUntil = 0;
-            Session s = s();
-            s.reset();
-            s.save();
-            s.logCsv("RESET", "", 0, 0);
-            limitAlerted = false;
-            goalAlerted = false;
+            startNewSession("RESET");
             bar(Formatting.YELLOW, "Session reset");
         } else {
             resetArmedUntil = now + 5000;
             bar(Formatting.GOLD, "Run /ds reset again within 5s to confirm");
         }
+    }
+
+    /**
+     * Ends the current session and starts a fresh one (timer, history and stats go back to zero; settings are kept).
+     * The finished session's summary is appended to donutstreamer/sessions.log first.
+     */
+    public static void startNewSession(String reason) {
+        Session s = s();
+        if (!s.history.isEmpty() || s.elapsedMs >= 1000) s.logSessionEnd(reason, s.summary());
+        s.reset();
+        s.sessionDay = LocalDate.now().toString();
+        s.save();
+        s.logCsv(reason, "", 0, 0);
+        limitAlerted = false;
+        goalAlerted = false;
+    }
+
+    private static long lastDayCheck = 0;
+
+    /** Called every client tick (throttled to once a second): starts a new session when the local date changes. */
+    public static void checkNewDay() {
+        long now = System.currentTimeMillis();
+        if (now - lastDayCheck < 1000) return;
+        lastDayCheck = now;
+        Session s = s();
+        String today = LocalDate.now().toString();
+        if (s.sessionDay == null || s.sessionDay.isEmpty()) {
+            s.sessionDay = today;      // config from before this feature: adopt today, don't wipe anything
+            s.save();
+        } else if (!s.sessionDay.equals(today)) {
+            if (s.dailyReset) {
+                boolean had = !s.history.isEmpty() || s.elapsedMs >= 1000;
+                String previous = s.summary();
+                startNewSession("NEW_DAY");
+                if (had) s.pendingNotice = previous;
+            } else {
+                s.sessionDay = today;
+                s.save();
+            }
+        }
+        if (s.pendingNotice != null && MinecraftClient.getInstance().player != null) {
+            chat(Formatting.GOLD, "[Tracker] New day: started a fresh session.");
+            chat(Formatting.GRAY, "Previous session: " + s.pendingNotice);
+            s.pendingNotice = null;
+        }
+    }
+
+    public static void toggleDailyReset() {
+        s().dailyReset = !s().dailyReset;
+        s().sessionDay = LocalDate.now().toString();
+        s().save();
+        bar(Formatting.GRAY, "New session every day at midnight " + (s().dailyReset ? "on" : "off"));
+    }
+
+    public static void toggleChatPreviews() {
+        s().chatPreviews = !s().chatPreviews;
+        s().save();
+        bar(Formatting.GRAY, "Auction / music previews in chat " + (s().chatPreviews ? "on" : "off"));
+    }
+
+    public static void toggleAuctionStreamDelay() {
+        s().auctionStreamDelay = !s().auctionStreamDelay;
+        s().save();
+        bar(Formatting.GRAY, AuctionState.STREAM_DELAY_SECONDS + "s stream-delay countdown after each auction "
+                + (s().auctionStreamDelay ? "on (applies to the next auction)" : "off"));
+    }
+
+    public static void toggleNametagRank() {
+        s().selfNametagRank = !s().selfNametagRank;
+        s().save();
+        bar(Formatting.GRAY, "Rank on own nametag " + (s().selfNametagRank ? "on" : "off"));
     }
 
     public static void toggleHud() {
@@ -282,7 +354,8 @@ public final class Actions {
     public static void announceAuctionStart(String item, long minBid, int seconds) {
         auctionChat(Text.literal("Started auction for ").formatted(Formatting.GRAY)
                 .append(Text.literal(item).formatted(Formatting.WHITE))
-                .append(Text.literal(" (min bid $" + Money.format(minBid) + ", " + TimeParse.format(seconds) + ")")
+                .append(Text.literal(" (min bid $" + Money.format(minBid) + ", " + TimeParse.format(seconds)
+                        + (s().auctionStreamDelay ? ", then " + AuctionState.STREAM_DELAY_SECONDS + "s stream-delay countdown" : "") + ")")
                         .formatted(Formatting.GRAY)));
     }
 
@@ -305,7 +378,9 @@ public final class Actions {
                 ? st.getHighestBidder() + " with $" + Money.format(st.getHighestBid())
                 : "no bids yet";
         auctionChat(Text.literal(st.getCurrentItemName()).formatted(Formatting.WHITE)
-                .append(Text.literal("  |  ends in " + TimeParse.clock((st.getRemainingMillis() + 999) / 1000)
+                .append(Text.literal("  |  " + (st.isInDelay()
+                                ? "stream delay ends in " + TimeParse.clock((st.getDelayRemainingMillis() + 999) / 1000)
+                                : "ends in " + TimeParse.clock((st.getRemainingMillis() + 999) / 1000))
                         + "  |  min $" + Money.format(st.getMinimumBid()) + "  |  top: " + top)
                         .formatted(Formatting.GRAY)));
     }
@@ -349,6 +424,11 @@ public final class Actions {
         s().trackAuctionPayments = !s().trackAuctionPayments;
         s().save();
         bar(Formatting.GRAY, "Auction bids " + (s().trackAuctionPayments ? "also count" : "do not count") + " in the tracker");
+    }
+
+    public static void openSettings() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        mc.send(() -> mc.setScreen(new SettingsScreen()));   // next tick, so the chat screen can close first
     }
 
     public static void openWindow() {
@@ -495,165 +575,17 @@ public final class Actions {
         bar(Formatting.GRAY, "Hide !commands in stream chat " + onOff(now));
     }
 
-    // ================= per-element look, themes, number format, chat settings =================
-
-    public static void setWidgetOn(Widgets.W w, boolean on) {
-        s().cfg(w).on = on;
-        s().save();
-        bar(Formatting.GRAY, w.label + " " + (on ? "on" : "off"));
-    }
-
-    public static void setWidgetScale(Widgets.W w, float v) {
-        s().cfg(w).scale = Math.max(0.4f, Math.min(4.0f, v));
-        s().save();
-        bar(Formatting.GRAY, w.label + " size " + String.format(java.util.Locale.ROOT, "%.2f", s().cfg(w).scale));
-    }
-
-    public static void setWidgetBg(Widgets.W w, int percent) {
-        s().cfg(w).bg = Math.max(10, Math.min(100, percent)) / 100f;
-        s().save();
-        bar(Formatting.GRAY, w.label + " background " + Math.round(s().cfg(w).bg * 100) + "%");
-    }
-
-    public static void setWidgetColor(Widgets.W w, String color) {
-        if (color == null || color.equalsIgnoreCase("default") || color.equalsIgnoreCase("reset")) {
-            s().cfg(w).accent = 0;
-            s().save();
-            bar(Formatting.GRAY, w.label + " colour back to default");
-            return;
-        }
-        Integer c = Theme.parseColor(color);
-        if (c == null) {
-            chat(Formatting.RED, "Colours: " + String.join(", ", Theme.colorNames()) + ", or #RRGGBB (or \"default\").");
-            return;
-        }
-        s().cfg(w).accent = c;
-        s().save();
-        bar(Formatting.GRAY, w.label + " colour set");
-    }
-
-    public static void resetWidget(Widgets.W w) {
-        Session.WidgetCfg c = s().cfg(w);
-        int[] p = Widgets.defaultPos(w);
-        c.x = p[0];
-        c.y = p[1];
-        c.scale = 1.0f;
-        c.bg = 1.0f;
-        c.accent = 0;
-        s().save();
-        bar(Formatting.GRAY, w.label + " reset");
-    }
-
-    public static void themeList() {
-        chat(Formatting.GOLD, "HUD themes (current: " + s().theme + "). Use /ds theme <name>:");
-        for (Theme.Preset p : Theme.PRESETS) {
-            chat(p.id().equals(s().theme) ? Formatting.GREEN : Formatting.WHITE, "  " + p.id() + " - " + p.label());
-        }
-    }
-
-    public static void setTheme(String id) {
-        Theme.Preset p = Theme.find(id);
-        if (p == null) {
-            chat(Formatting.RED, "No theme called \"" + id + "\". Run /ds theme for the list.");
-            return;
-        }
-        s().theme = p.id();
-        s().save();
-        bar(Formatting.GRAY, "Theme: " + p.label());
-    }
-
-    public static void toggleGlow() {
-        s().cardGlow = !s().cardGlow;
-        s().save();
-        bar(Formatting.GRAY, "Glowing card edges " + onOff(s().cardGlow));
-    }
-
-    public static void toggleShadow() {
-        s().cardShadow = !s().cardShadow;
-        s().save();
-        bar(Formatting.GRAY, "Card shadows " + onOff(s().cardShadow));
-    }
-
-    public static void toggleAnimations() {
-        s().animations = !s().animations;
-        s().save();
-        bar(Formatting.GRAY, "Animations " + onOff(s().animations));
-    }
-
-    public static void setMoneyFull(boolean full) {
-        s().moneyFull = full;
-        s().save();
-        bar(Formatting.GRAY, "Amounts shown as " + (full ? "45,000,000" : "45M"));
-    }
-
-    public static void setMoneyDecimals(int n) {
-        s().moneyDecimals = Math.max(0, Math.min(3, n));
-        s().save();
-        bar(Formatting.GRAY, "Short amounts use " + s().moneyDecimals + " decimals");
-    }
-
-    public static void chatSettings() {
-        chat(Formatting.LIGHT_PURPLE, "Stream chat settings (change with /ds chat set <option> <value>):");
-        for (String line : StreamChat.describe()) chat(Formatting.WHITE, "  " + line);
-        chat(Formatting.GRAY, "  Also: /ds chat ignore add|remove|list|clear <name>   /ds chat highlight add|remove|list|clear <word>");
-        chat(Formatting.GRAY, "  Size and background: /ds hud chat scale <n> and /ds hud chat bg <10-100>");
-    }
-
-    public static void chatSet(String key, String value) {
-        StreamChat.Result r = StreamChat.set(key, value);
-        chat(r.ok() ? Formatting.GREEN : Formatting.RED, r.message());
-    }
-
-    public static void chatIgnore(boolean add, String name) {
-        StreamChat.Result r = StreamChat.ignore(add, name);
-        chat(r.ok() ? Formatting.GRAY : Formatting.RED, r.message());
-    }
-
-    public static void chatIgnoreList() {
-        java.util.List<String> l = StreamChat.ignored();
-        chat(Formatting.GRAY, l.isEmpty() ? "Nobody is ignored." : "Ignored: " + String.join(", ", l));
-    }
-
-    public static void chatIgnoreClear() {
-        StreamChat.clearIgnored();
-        chat(Formatting.GRAY, "Ignore list cleared.");
-    }
-
-    public static void chatHighlight(boolean add, String word) {
-        StreamChat.Result r = StreamChat.highlight(add, word);
-        chat(r.ok() ? Formatting.GRAY : Formatting.RED, r.message());
-    }
-
-    public static void chatHighlightList() {
-        java.util.List<String> l = StreamChat.highlights();
-        chat(Formatting.GRAY, l.isEmpty() ? "No highlight words." : "Highlighting: " + String.join(", ", l));
-    }
-
-    public static void chatHighlightClear() {
-        StreamChat.clearHighlights();
-        chat(Formatting.GRAY, "Highlight words cleared.");
-    }
-
-    public static void customizeHelp() {
-        chat(Formatting.GOLD, "Customize everything:");
-        chat(Formatting.WHITE, "  Open chat and click \"HUD editor\": click an element to select it, drag to move, drag its bottom-right corner to resize, and use the panel for size, background, colour and reset.");
-        chat(Formatting.WHITE, "  /ds hud <element> scale <0.4-4> | bg <10-100> | color <name|#hex|default> | reset | on | off");
-        chat(Formatting.WHITE, "  /ds hud scale <n>   size of everything at once (multiplies with each element's own size)");
-        chat(Formatting.WHITE, "  /ds theme [name]   /ds style glow|shadow|animations   /ds format short|full|decimals <0-3>");
-        chat(Formatting.WHITE, "  /ds chat settings   all chat look + filter options    /ds music source|app   which player the music panel follows");
-        chat(Formatting.WHITE, "  /ds stream status   stream-safety options              /ds help   everything else");
-    }
-
     public static void help() {
         chat(Formatting.GOLD, "Donut Streamer (all local). Profit is read from payment messages in chat.");
+        chat(Formatting.WHITE, "/ds settings  opens the settings screen (HUD, per-element size, chat, music, stream).");
         chat(Formatting.WHITE, "/ds  opens the tracker window. In chat, use the \"HUD editor\" button; drag elements to move.");
         chat(Formatting.WHITE, "/ds in|out <amt> [name]  /ds buy <amt> [item]  /ds sell <amt>  (manual entry)   /ds undo  /ds reset  /ds summary  /ds players");
+        chat(Formatting.WHITE, "/ds daily (new session every midnight)  /ds preview (auction/music previews in chat)  /ds auction delay (+12s stream delay)  /ds nametag rank");
         chat(Formatting.WHITE, "/ds limit|goal <amt|off>  /ds tilt <2-20|off>  /ds rakeback <0.5-50|off>  /ds balance <amt|off>");
         chat(Formatting.WHITE, "/ds percent  /ds sells  /ds sellsource  /ds doubles  /ds sound  /ds names  /ds hud toggle|reset|all on|all off|scale <n>|<element>");
         chat(Formatting.AQUA, "Auctions (DonutSMP): B opens the browser, H shows/hides the panel.");
-        chat(Formatting.GREEN, "Spotify remote: /ds music login <clientId>, then \\ play/pause, ] next, [ previous (rebindable).");
-        chat(Formatting.WHITE, "/ds music play|pause|toggle|next|prev|volume <0-100>|status|logout");
-        chat(Formatting.GOLD, "Look: /ds customize (per-element size/background/colour, themes, number format, chat options)");
+        chat(Formatting.GREEN, "Music (YouTube, no Premium): /ds music setup once, then \\ play/pause, ] next, [ previous (rebindable).");
+        chat(Formatting.WHITE, "/ds music play|pause|toggle|next|prev|volume <0-100>|mute|muteads|port <n>|status|setup");
         chat(Formatting.AQUA, "Stream: /ds stream (mode on/off)  /ds stream coords|chatcoords|names|status  /ds nametag (own tag in F5)  /ds watermark");
         chat(Formatting.LIGHT_PURPLE, "Stream chat: /ds chat twitch <channel>|off  /ds chat youtube <link>|off  /ds chat youtubekey paste|<key>|clear  /ds chat off|clear|commands|status");
         chat(Formatting.WHITE, "/ds auction start \"<item>\" <min bid> [time]  /ds auction stop|status|browser  /ds auction track|anywhere");
