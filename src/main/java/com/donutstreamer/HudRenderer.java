@@ -22,6 +22,7 @@ public final class HudRenderer implements HudElement {
         boolean browserOpen = mc.currentScreen instanceof AuctionBrowserScreen;
 
         for (Widgets.W w : Widgets.ALL) {
+            if (w == Widgets.W.GRAPH) continue;   // the profit chart is drawn inside the Live profit card
             Session.WidgetCfg c = s.cfg(w);
             if (!c.on || !Widgets.available(w, s)) continue;
             if (w == Widgets.W.AUCTION && browserOpen) continue;   // the browser shows the same info
@@ -46,7 +47,7 @@ public final class HudRenderer implements HudElement {
 
     /** Keeps a widget on screen when the window or GUI scale shrinks (changes the saved position). */
     static void fit(Session.WidgetCfg c, Widgets.W w, Session s, MinecraftClient mc, TextRenderer tr) {
-        float sc = s.scaleOf(w);
+        float sc = s.scaleOf(c);
         int bw = Math.round(Widgets.width(w, s, tr) * sc);
         int bh = Math.round(Widgets.height(w) * sc);
         int maxX = Math.max(0, mc.getWindow().getScaledWidth() - bw);
@@ -59,11 +60,14 @@ public final class HudRenderer implements HudElement {
         Matrix3x2fStack m = ctx.getMatrices();
         m.pushMatrix();
         m.translate((float) c.x, (float) c.y);
-        float sc = s.scaleOf(w);
+        float sc = s.scaleOf(c);
         m.scale(sc, sc);
-        Ui.cardBg = c.bg;
-        Widgets.draw(w, s, ctx, mc.textRenderer, c.accent);
-        Ui.cardBg = 1.0f;
+        Ui.bgMul = c.bgAlpha / 100f;
+        try {
+            Widgets.draw(w, s, ctx, mc.textRenderer);
+        } finally {
+            Ui.bgMul = 1.0f;
+        }
         m.popMatrix();
     }
 }
