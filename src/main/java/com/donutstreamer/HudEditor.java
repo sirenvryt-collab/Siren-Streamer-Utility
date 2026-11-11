@@ -13,10 +13,10 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Editing UI that lives on the chat screen: click an element to select it, drag it to move it, drag the little
- * square on its bottom-right corner to resize just that element, and use the panel that appears for size,
- * background, colour, on/off and reset. The "HUD editor" button (top right) holds the global switches.
- * Purely local; it only changes where, how big and how a number is drawn.
+ * Editing UI that lives on the chat screen: drag any HUD element with the left mouse button (it snaps to the
+ * screen edges and centre; hold Shift to move freely), resize one element by dragging up/down with the right mouse
+ * button, and use the "HUD editor" button (top right) to switch elements on and off or open /ds settings.
+ * Purely local; it only changes where/whether numbers are drawn.
  */
 public final class HudEditor {
     private HudEditor() {}
@@ -29,11 +29,11 @@ public final class HudEditor {
     private static Screen registeredFor = null;
     private static boolean panelOpen = false;
     private static boolean prevDown = false;
+    private static boolean prevRight = false;
     private static Widgets.W dragging = null;
-    private static Widgets.W selected = null;
-    private static boolean resizing = false;
-    private static final int[] SWATCHES = {0xFFFFD700, 0xFF55FF55, 0xFFFF5555, 0xFF55FFFF, 0xFF5599FF, 0xFFB07CFF, 0xFFFF7EDB, 0xFFFFA040};
-    private static final int INSP_W = 214, INSP_H = 80;
+    private static Widgets.W resizing = null;
+    private static int rsStartY;
+    private static float rsStartScale;
     private static int dragDX, dragDY;
     private static int labelW = -1;
     private static final int WHITE_TICK = 0xFFFFFFFF;
@@ -44,6 +44,7 @@ public final class HudEditor {
 
     private static List<Row> buildRows() {
         List<Row> rows = new ArrayList<>();
+        rows.add(new Row("Open settings (/ds settings)", null, Actions::openSettings));
         rows.add(new Row("Show HUD", () -> session().hudVisible, () -> session().hudVisible = !session().hudVisible));
         rows.add(new Row("Turn ALL elements on", null, () -> {
             for (Widgets.W w : Widgets.ALL) session().cfg(w).on = true;
@@ -71,17 +72,19 @@ public final class HudEditor {
         rows.add(new Row("Hide coords in chat (stream mode)", () -> session().streamHideChatCoords,
                 () -> session().streamHideChatCoords = !session().streamHideChatCoords));
         rows.add(new Row("Own nametag in F5", () -> session().selfNametag, () -> session().selfNametag = !session().selfNametag));
+        rows.add(new Row("Rank on own nametag", () -> session().selfNametagRank, () -> session().selfNametagRank = !session().selfNametagRank));
+        rows.add(new Row("New session every midnight", () -> session().dailyReset, () -> {
+            session().dailyReset = !session().dailyReset;
+            session().sessionDay = java.time.LocalDate.now().toString();
+        }));
+        rows.add(new Row("Auction/music previews in chat", () -> session().chatPreviews, () -> session().chatPreviews = !session().chatPreviews));
+        rows.add(new Row("Auction 12s stream-delay countdown", () -> session().auctionStreamDelay, () -> session().auctionStreamDelay = !session().auctionStreamDelay));
         rows.add(new Row("Sirens watermark", () -> session().watermark, () -> session().watermark = !session().watermark));
-        rows.add(new Row("Animations (pulses, equalizer)", () -> session().animations, () -> session().animations = !session().animations));
-        rows.add(new Row("Glowing card edges", () -> session().cardGlow, () -> session().cardGlow = !session().cardGlow));
-        rows.add(new Row("Card shadows", () -> session().cardShadow, () -> session().cardShadow = !session().cardShadow));
-        rows.add(new Row("Full amounts (45,000,000)", () -> session().moneyFull, () -> session().moneyFull = !session().moneyFull));
         rows.add(new Row("Sounds", () -> session().sound, () -> session().sound = !session().sound));
         rows.add(new Row("Show player names", () -> session().showNames, () -> session().showNames = !session().showNames));
-        rows.add(new Row("Reset HUD layout", null, () -> {
+        rows.add(new Row("Reset HUD layout (positions and sizes)", null, () -> {
             session().widgets.clear();
             session().scale = 1.0f;
-            selected = null;
         }));
         return List.copyOf(rows);
     }
@@ -90,15 +93,16 @@ public final class HudEditor {
         ScreenEvents.AFTER_INIT.register((client, screen, w, h) -> {
             if (!(screen instanceof ChatScreen)) return;
             prevDown = leftDown(client);
+            prevRight = rightDown(client);
             dragging = null;
-            resizing = false;
+            resizing = null;
             if (registeredFor == screen) return;   // AFTER_INIT also fires on window resize
             registeredFor = screen;
             ScreenEvents.afterRender(screen).register((scr, ctx, mx, my, delta) -> render(client, ctx, mx, my));
             ScreenEvents.remove(screen).register(scr -> {
-                if (dragging != null || resizing) {
+                if (dragging != null || resizing != null) {
                     dragging = null;
-                    resizing = false;
+                    resizing = null;
                     session().save();
                 }
                 if (registeredFor == scr) registeredFor = null;
@@ -108,6 +112,25 @@ public final class HudEditor {
 
     private static boolean leftDown(MinecraftClient mc) {
         return GLFW.glfwGetMouseButton(mc.getWindow().getHandle(), GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
+    }
+
+    private static boolean rightDown(MinecraftClient mc) {
+        return GLFW.glfwGetMouseButton(mc.getWindow().getHandle(), GLFW.GLFW_MOUSE_BUTTON_RIGHT) == GLFW.GLFW_PRESS;
+    }
+
+    private static boolean shiftDown(MinecraftClient mc) {
+        long h = mc.getWindow().getHandle();
+        return GLFW.glfwGetKey(h, GLFW.GLFW_KEY_LEFT_SHIFT) == GLFW.GLFW_PRESS
+                || GLFW.glfwGetKey(h, GLFW.GLFW_KEY_RIGHT_SHIFT) == GLFW.GLFW_PRESS;
+    }
+
+    private static int snap(int v, int size, int total, boolean free) {
+        if (free) return v;
+        if (Math.abs(v) < 5) return 0;
+        if (Math.abs(v + size - total) < 5) return total - size;
+        int mid = total / 2 - size / 2;
+        if (Math.abs(v - mid) < 5) return mid;
+        return v;
     }
 
     private static boolean inside(int mx, int my, int x, int y, int w, int h) {
@@ -131,29 +154,35 @@ public final class HudEditor {
         boolean pressed = down && !prevDown;
         boolean released = !down && prevDown;
         prevDown = down;
+        boolean rdown = rightDown(mc);
+        boolean rpressed = rdown && !prevRight;
+        boolean rreleased = !rdown && prevRight;
+        prevRight = rdown;
 
         // ---- widgets: draw ghosts for ones with no data yet, then outlines ----
         Widgets.W hovered = null;
         if (s.hudVisible) {
             for (Widgets.W w : Widgets.ALL) {
+                if (w == Widgets.W.GRAPH) continue;   // the profit chart lives inside the Live profit card
                 Session.WidgetCfg c = s.cfg(w);
-                if (!c.on) continue;
-                if (dragging != w && !(resizing && selected == w)) HudRenderer.fit(c, w, s, mc, tr);
+                if (!c.on || Widgets.previewHidden(w, s)) continue;
+                if (dragging != w) HudRenderer.fit(c, w, s, mc, tr);
                 if (!Widgets.available(w, s)) HudRenderer.drawAt(ctx, mc, s, w, c);
-                float sc = s.scaleOf(w);
+                float sc = s.scaleOf(c);
                 int bw = Math.round(Widgets.width(w, s, tr) * sc);
                 int bh = Math.round(Widgets.height(w) * sc);
                 boolean over = inside(mx, my, c.x, c.y, bw, bh);
                 if (over) hovered = w;
-                boolean sel = selected == w;
+                boolean active = dragging == w || resizing == w;
                 outline(ctx, c.x - 1, c.y - 1, bw + 2, bh + 2,
-                        sel ? 0xFF55FFFF : (dragging == w ? 0xFFFFFF55 : (over ? 0xFFFFFFFF : 0x88FFFFFF)));
-                if (sel) {
-                    int hx = c.x + bw - 4, hy = c.y + bh - 4;
-                    boolean overHandle = inside(mx, my, hx - 2, hy - 2, 10, 10);
-                    ctx.fill(hx, hy, hx + 7, hy + 7, resizing || overHandle ? 0xFFFFFFFF : 0xFF55FFFF);
-                    ctx.fill(hx + 1, hy + 1, hx + 6, hy + 6, 0xFF0D1117);
-                    ctx.fill(hx + 2, hy + 2, hx + 5, hy + 5, resizing || overHandle ? 0xFFFFFFFF : 0xFF55FFFF);
+                        active ? 0xFFFFFF55 : (over ? 0xFFFFFFFF : 0x88FFFFFF));
+                if (over || active) {
+                    String tip = w.label + "  " + (Math.round(c.scale * 100) / 100f) + "x"
+                            + (active ? "" : "  (right-drag up/down = resize)");
+                    int ty = c.y >= 11 ? c.y - 11 : c.y + bh + 2;
+                    int tw = tr.getWidth(tip);
+                    Ui.box(ctx, c.x, ty - 1, tw + 6, 11, 0xE00D1117, 0xFF30363D);
+                    ctx.drawTextWithShadow(tr, tip, c.x + 3, ty, Widgets.WHITE);
                 }
             }
         }
@@ -182,13 +211,6 @@ public final class HudEditor {
             overPanel = inside(mx, my, panelX, panelY, panelW, panelH);
         }
 
-        // ---- inspector geometry (top centre, nudged left of the global panel) ----
-        int inspX = Math.max(4, Math.min(sw / 2 - INSP_W / 2, sw - INSP_W - 4));
-        if (panelOpen) inspX = Math.max(4, Math.min(inspX, panelX - INSP_W - 6));
-        int inspY = 4;
-        boolean inspVisible = selected != null;
-        boolean overInsp = inspVisible && inside(mx, my, inspX, inspY, INSP_W, INSP_H);
-
         boolean consumed = false;
         if (pressed) {
             if (overBtn) {
@@ -203,55 +225,47 @@ public final class HudEditor {
                     s.save();
                 }
                 consumed = true;
-            } else if (overInsp) {
-                consumed = true;   // the controls below act on this click
             }
         }
 
-        // ---- resize handle, then dragging ----
-        if (pressed && !consumed && selected != null && s.cfg(selected).on) {
-            Session.WidgetCfg c = s.cfg(selected);
-            float sc = s.scaleOf(selected);
-            int bw = Math.round(Widgets.width(selected, s, tr) * sc);
-            int bh = Math.round(Widgets.height(selected) * sc);
-            if (inside(mx, my, c.x + bw - 6, c.y + bh - 6, 10, 10)) {
-                resizing = true;
-                consumed = true;
-            }
+        // ---- dragging ----
+        if (pressed && !consumed && hovered != null) {
+            Session.WidgetCfg c = s.cfg(hovered);
+            dragging = hovered;
+            dragDX = mx - c.x;
+            dragDY = my - c.y;
         }
-        if (pressed && !consumed) {
-            if (hovered != null) {
-                Session.WidgetCfg c = s.cfg(hovered);
-                selected = hovered;
-                dragging = hovered;
-                dragDX = mx - c.x;
-                dragDY = my - c.y;
-            } else {
-                selected = null;
-            }
+        if (rpressed && !consumed && hovered != null && dragging == null) {
+            Session.WidgetCfg c = s.cfg(hovered);
+            resizing = hovered;
+            rsStartY = my;
+            rsStartScale = c.scale;
         }
-        if (resizing && selected != null) {
-            if (down) {
-                Session.WidgetCfg c = s.cfg(selected);
-                float baseW = Math.max(8, Widgets.width(selected, s, tr));
-                float total = (mx - c.x) / baseW;
-                float own = Math.round((total / s.scale) * 20f) / 20f;      // snaps to 0.05
-                c.scale = Math.max(0.4f, Math.min(4.0f, own));
+        if (resizing != null) {
+            if (rdown) {
+                Session.WidgetCfg c = s.cfg(resizing);
+                float v = Math.round((rsStartScale + (rsStartY - my) * 0.01f) * 20f) / 20f;
+                c.scale = Math.max(0.4f, Math.min(4.0f, v));
+                HudRenderer.fit(c, resizing, s, mc, tr);
             }
-            if (released) {
-                resizing = false;
+            if (rreleased) {
+                resizing = null;
                 s.save();
             }
-        } else if (dragging != null) {
+        }
+        if (dragging != null) {
             if (down) {
                 Session.WidgetCfg c = s.cfg(dragging);
-                float sc = s.scaleOf(dragging);
+                float sc = s.scaleOf(c);
                 int bw = Math.round(Widgets.width(dragging, s, tr) * sc);
                 int bh = Math.round(Widgets.height(dragging) * sc);
                 int maxX = Math.max(0, sw - bw);
                 int maxY = Math.max(0, screenH - bh);
-                c.x = Math.max(0, Math.min(maxX, mx - dragDX));
-                c.y = Math.max(0, Math.min(maxY, my - dragDY));
+                boolean free = shiftDown(mc);
+                int nx = snap(mx - dragDX, bw, sw, free);
+                int ny = snap(my - dragDY, bh, screenH, free);
+                c.x = Math.max(0, Math.min(maxX, nx));
+                c.y = Math.max(0, Math.min(maxY, ny));
             }
             if (released) {
                 dragging = null;
@@ -294,112 +308,5 @@ public final class HudEditor {
                 ctx.drawTextWithShadow(tr, r.label(), textX, ry + 1, color);
             }
         }
-
-        if (inspVisible) drawInspector(ctx, tr, s, selected, inspX, inspY, mx, my, pressed && overInsp);
-    }
-
-    // ================= inspector (select an element to see it) =================
-
-    /** Small rounded button; returns true when clicked this frame. */
-    private static boolean button(DrawContext ctx, TextRenderer tr, int x, int y, int w, int h, String label,
-                                  int mx, int my, boolean click, int textColor) {
-        boolean over = inside(mx, my, x, y, w, h);
-        Ui.roundRect(ctx, x, y, w, h, over ? 0xFF3A4352 : 0xFF232A35);
-        ctx.fill(x + 1, y, x + w - 1, y + 1, 0x20FFFFFF);
-        ctx.drawTextWithShadow(tr, label, x + (w - tr.getWidth(label)) / 2, y + (h - 8) / 2, textColor);
-        return click && over;
-    }
-
-    private static void drawInspector(DrawContext ctx, TextRenderer tr, Session s, Widgets.W w, int x, int y,
-                                      int mx, int my, boolean click) {
-        Session.WidgetCfg c = s.cfg(w);
-        ctx.fill(x + 2, y + INSP_H, x + INSP_W + 1, y + INSP_H + 2, 0x55000000);
-        ctx.fill(x + INSP_W, y + 2, x + INSP_W + 2, y + INSP_H + 2, 0x55000000);
-        Ui.box(ctx, x, y, INSP_W, INSP_H, 0xF40D1117, 0xFF55FFFF);
-        ctx.fill(x + 1, y + 1, x + INSP_W - 1, y + 2, 0x24FFFFFF);
-
-        // title + on/off
-        ctx.drawTextWithShadow(tr, w.label, x + 6, y + 5, Widgets.GOLD);
-        if (button(ctx, tr, x + INSP_W - 34, y + 3, 28, 11, c.on ? "ON" : "OFF", mx, my, click,
-                c.on ? Widgets.GREEN : Widgets.GRAY)) {
-            c.on = !c.on;
-            s.save();
-        }
-
-        // size row
-        int ry = y + 19;
-        ctx.drawTextWithShadow(tr, "Size", x + 6, ry + 2, Widgets.GRAY);
-        if (button(ctx, tr, x + 56, ry, 14, 12, "-", mx, my, click, Widgets.WHITE)) {
-            c.scale = Math.max(0.4f, Math.round((c.scale - 0.1f) * 20f) / 20f);
-            s.save();
-        }
-        String sizeText = String.format(java.util.Locale.ROOT, "%.2fx", c.scale);
-        ctx.drawTextWithShadow(tr, sizeText, x + 74 + (40 - tr.getWidth(sizeText)) / 2, ry + 2, Widgets.WHITE);
-        if (button(ctx, tr, x + 118, ry, 14, 12, "+", mx, my, click, Widgets.WHITE)) {
-            c.scale = Math.min(4.0f, Math.round((c.scale + 0.1f) * 20f) / 20f);
-            s.save();
-        }
-        if (button(ctx, tr, x + 138, ry, 30, 12, "1x", mx, my, click, Widgets.AQUA)) {
-            c.scale = 1.0f;
-            s.save();
-        }
-
-        // background row
-        ry = y + 34;
-        ctx.drawTextWithShadow(tr, "Back", x + 6, ry + 2, Widgets.GRAY);
-        if (button(ctx, tr, x + 56, ry, 14, 12, "-", mx, my, click, Widgets.WHITE)) {
-            c.bg = Math.max(0.1f, Math.round((c.bg - 0.1f) * 10f) / 10f);
-            s.save();
-        }
-        String bgText = Math.round(c.bg * 100) + "%";
-        ctx.drawTextWithShadow(tr, bgText, x + 74 + (40 - tr.getWidth(bgText)) / 2, ry + 2, Widgets.WHITE);
-        if (button(ctx, tr, x + 118, ry, 14, 12, "+", mx, my, click, Widgets.WHITE)) {
-            c.bg = Math.min(1.0f, Math.round((c.bg + 0.1f) * 10f) / 10f);
-            s.save();
-        }
-        if (button(ctx, tr, x + 138, ry, 30, 12, "100%", mx, my, click, Widgets.AQUA)) {
-            c.bg = 1.0f;
-            s.save();
-        }
-
-        // colour row: "A" = automatic, then swatches
-        ry = y + 49;
-        ctx.drawTextWithShadow(tr, "Color", x + 6, ry + 2, Widgets.GRAY);
-        int sx = x + 44;
-        boolean auto = c.accent == 0;
-        Ui.roundRect(ctx, sx, ry, 12, 12, auto ? 0xFFFFFFFF : 0xFF3A4352);
-        Ui.roundRect(ctx, sx + 1, ry + 1, 10, 10, 0xFF232A35);
-        ctx.drawTextWithShadow(tr, "A", sx + 3, ry + 2, auto ? Widgets.WHITE : Widgets.GRAY);
-        if (inside(mx, my, sx, ry, 12, 12) && click) {
-            c.accent = 0;
-            s.save();
-        }
-        for (int i = 0; i < SWATCHES.length; i++) {
-            int cx = sx + 15 + i * 14;
-            boolean on = c.accent == SWATCHES[i];
-            Ui.roundRect(ctx, cx, ry, 12, 12, on ? 0xFFFFFFFF : 0xFF3A4352);
-            Ui.roundRect(ctx, cx + 1, ry + 1, 10, 10, SWATCHES[i]);
-            if (inside(mx, my, cx, ry, 12, 12) && click) {
-                c.accent = SWATCHES[i];
-                s.save();
-            }
-        }
-
-        // buttons
-        ry = y + 65;
-        if (button(ctx, tr, x + 6, ry, 80, 12, "Reset element", mx, my, click, Widgets.GOLD)) {
-            Widgets.W target = w;
-            int[] p = Widgets.defaultPos(target);
-            c.x = p[0];
-            c.y = p[1];
-            c.scale = 1.0f;
-            c.bg = 1.0f;
-            c.accent = 0;
-            s.save();
-        }
-        if (button(ctx, tr, x + 92, ry, 44, 12, "Deselect", mx, my, click, Widgets.GRAY)) {
-            selected = null;
-        }
-        ctx.drawTextWithShadow(tr, "drag the corner to resize", x + 142, ry + 2, 0xFF6E7681);
     }
 }
