@@ -1,7 +1,10 @@
 package com.donutstreamer;
 
+import com.google.gson.ExclusionStrategy;
+import com.google.gson.FieldAttributes;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
 import net.fabricmc.loader.api.FabricLoader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,6 +46,20 @@ public final class Session {
     private static final Logger LOG = LoggerFactory.getLogger("donutstreamer");
     private static final Gson PRETTY = new GsonBuilder().setPrettyPrinting().create();
     private static final Gson COMPACT = new Gson();
+    /** Everything except the (potentially large) history list; the history is turned into JSON on the writer thread. */
+    private static final Gson NO_HISTORY = new GsonBuilder()
+            .setExclusionStrategies(new ExclusionStrategy() {
+                @Override
+                public boolean shouldSkipField(FieldAttributes f) {
+                    return f.getDeclaringClass() == Session.class && "history".equals(f.getName());
+                }
+
+                @Override
+                public boolean shouldSkipClass(Class<?> c) {
+                    return false;
+                }
+            })
+            .create();
 
     private static final long SAVE_INTERVAL_MS = 5_000L;
     private static final String CSV_HEADER = "time,type,player,amount,delta,net_after\n";
@@ -63,13 +80,19 @@ public final class Session {
         public long amount;
         public String who = "";
         public long time;
+        public long tax;     // tax charged on top of an OUT payment ("You paid X $amount (+$tax tax)")
 
         public Entry() {}
 
         public Entry(String kind, String who, long amount) {
+            this(kind, who, amount, 0);
+        }
+
+        public Entry(String kind, String who, long amount, long tax) {
             this.kind = kind;
             this.who = who == null ? "" : who;
             this.amount = amount;
+            this.tax = Math.max(0, tax);
             this.time = System.currentTimeMillis();
         }
     }
@@ -78,9 +101,9 @@ public final class Session {
         public boolean on;
         public int x;
         public int y;
-        public float scale = 1.0f;   // this element's own size, multiplied with the global HUD scale
-        public float bg = 1.0f;      // background opacity 0.1 .. 1
-        public int accent = 0;       // 0 = default colour, otherwise an ARGB override for the glowing edge
+        public float scale = 1.0f;     // this element's own size, multiplied with the global HUD scale
+        public int bgAlpha = 100;      // card background opacity in percent (0 = see-through)
+        public int accent = 0;         // 0 = automatic colour, otherwise 0xRRGGBB override for the edge and bars
 
         public WidgetCfg() {}
 
@@ -117,6 +140,11 @@ public final class Session {
     public boolean streamHideChatCoords = false;   // blank out "x, y, z" style coordinates in incoming chat while stream mode is on
     public boolean streamHideNames = true;   // hide player names on the HUD while stream mode is on
     public boolean selfNametag = true;       // show your own nametag in third person (F5), like others see it
+    public boolean selfNametagRank = true;   // also show the rank from your tab-list name on that nametag
+    public boolean dailyReset = true;        // start a fresh session automatically at local midnight
+    public String sessionDay = "";           // local date (yyyy-MM-dd) the current session belongs to
+    public boolean chatPreviews = true;      // chat screen: draw the auction / music panels as previews when they have nothing to show
+    public boolean auctionStreamDelay = false;   // add 12 seconds to every auction so a delayed stream can still bid
     public boolean watermark = true;         // small blue "Sirens Streamer Mod" text, bottom left
     public boolean percentMode = false;      // show net as % of starting balance
     public boolean includeSells = false;     // count sell income in net profit
@@ -125,19 +153,31 @@ public final class Session {
     public boolean trackAuctionPayments = true;   // payments that count as auction bids also go in the tracker
     public boolean auctionAnyServer = false;      // allow auction tools outside DonutSMP (testing)
     public float scale = 1.0f;
-    public String theme = "default";         // card look, see Theme
-    public boolean cardGlow = true;          // glowing accent edge on cards
-    public boolean cardShadow = true;        // soft drop shadow under cards
-    public boolean animations = true;        // pulses, equalizer, flashes (off = still, and a touch cheaper)
-    public boolean moneyFull = false;        // 45,000,000 instead of 45M
-    public int moneyDecimals = 2;            // decimals in short amounts (45.25M)
-    public String musicSource = "system";    // "system" (any player, no account) or "spotify" (Web API)
-    public String musicApp = "";             // only follow players whose name contains this (empty = whatever Windows says is current)
+
+    // ---- stream chat panel (see /ds settings > Chat) ----
+    public int chatWidth = 230;            // panel width in GUI pixels
+    public int chatHeight = 100;           // panel height; older messages scroll off the top
+    public int chatMaxLines = 0;           // lines per message, 0 = show every message in full
+    public int chatFadeSec = 90;           // older lines dim after this many seconds, 0 = never dim
+    public int chatLineGap = 1;            // extra pixels between lines
+    public int chatTextColor = 0;          // index into ChatPanel.TEXT_COLORS
+    public boolean chatShowHeader = true;
+    public boolean chatShowMarker = true;  // coloured Twitch / YouTube square before each message
+    public boolean chatViewerColors = true;
+    public boolean chatShadow = true;
+
+    // ---- music panel ----
+    public boolean musicCover = true;
+    public boolean musicEqualizer = true;
+
     public Map<String, WidgetCfg> widgets = new LinkedHashMap<>();
 
     // ---- derived (not saved) ----
-    public transient long net, received, sent, sold, biggestIn, biggestOut, peak, low, spent;
+    public transient long net, received, sent, sold, biggestIn, biggestOut, peak, low, spent, taxPaid;
     public transient int wins, losses, streak, bestWinStreak, worstLossStreak;
+
+    /** Set when a new day started a fresh session; the previous summary is printed once a player is in a world. */
+    public transient String pendingNotice;
 
     /** Bumped on every change to data or settings; the HUD uses it to know when cached text is stale. */
     public transient long version;
@@ -159,9 +199,9 @@ public final class Session {
         return c;
     }
 
-    /** Final on-screen size of a widget: global HUD scale times its own scale. */
-    public float scaleOf(Widgets.W w) {
-        return scale * cfg(w).scale;
+    /** On-screen scale of one element: the global HUD scale times the element's own size. */
+    public float scaleOf(WidgetCfg c) {
+        return scale * c.scale;
     }
 
     /** Whether HUD text may show player names (stream mode can force them off). */
@@ -172,13 +212,13 @@ public final class Session {
     /** Profit change an entry causes (sells count only when enabled). */
     public long delta(Entry e) {
         if (IN.equals(e.kind)) return e.amount;
-        if (OUT.equals(e.kind)) return -e.amount;
+        if (OUT.equals(e.kind)) return -(e.amount + e.tax);   // what you paid plus the tax on top
         if (BUY.equals(e.kind)) return -e.amount;
         return includeSells ? e.amount : 0;
     }
 
     public void recompute() {
-        received = 0; sent = 0; sold = 0; spent = 0; biggestIn = 0; biggestOut = 0;
+        received = 0; sent = 0; sold = 0; spent = 0; taxPaid = 0; biggestIn = 0; biggestOut = 0;
         wins = 0; losses = 0; streak = 0; bestWinStreak = 0; worstLossStreak = 0;
         peak = 0; low = 0;
         long run = 0;
@@ -194,6 +234,7 @@ public final class Session {
                 biggestIn = Math.max(biggestIn, e.amount);
             } else if (OUT.equals(e.kind)) {
                 sent += e.amount;
+                taxPaid += e.tax;
                 losses++;
                 ls++;
                 ws = 0;
@@ -209,7 +250,7 @@ public final class Session {
             peak = Math.max(peak, run);
             low = Math.min(low, run);
         }
-        net = received - sent - spent + (includeSells ? sold : 0);
+        net = received - sent - taxPaid - spent + (includeSells ? sold : 0);
 
         cumCache = null;
         resultsCache = null;
@@ -219,7 +260,11 @@ public final class Session {
     }
 
     public Entry add(String kind, String who, long amount) {
-        Entry e = new Entry(kind, who, amount);
+        return add(kind, who, amount, 0);
+    }
+
+    public Entry add(String kind, String who, long amount, long tax) {
+        Entry e = new Entry(kind, who, amount, tax);
         history.add(e);
         recompute();
         return e;
@@ -309,7 +354,7 @@ public final class Session {
                     return n;
                 });
                 p.count++;
-                if (IN.equals(e.kind)) p.in += e.amount; else p.out += e.amount;
+                if (IN.equals(e.kind)) p.in += e.amount; else p.out += e.amount + e.tax;
             }
             List<PlayerStat> list = new ArrayList<>(map.values());
             list.sort((a, b) -> Integer.compare(b.count, a.count));
@@ -370,11 +415,18 @@ public final class Session {
     }
 
     private void flushAsync() {
-        String json = (history.size() > 2000 ? COMPACT : PRETTY).toJson(this);
+        // Game thread: only the small settings part becomes JSON, plus a cheap pointer copy of the history list
+        // (entries are never changed after they are added). The big part is serialised and written on the IO thread,
+        // so saving never causes a frame hitch however long the session gets.
+        JsonObject root = NO_HISTORY.toJsonTree(this).getAsJsonObject();
+        List<Entry> snapshot = new ArrayList<>(history);
         dirty = false;
         lastFlush = System.currentTimeMillis();
         Path p = configPath();
-        submit(() -> writeConfig(p, json));
+        submit(() -> {
+            root.add("history", COMPACT.toJsonTree(snapshot));
+            writeConfig(p, (snapshot.size() > 2000 ? COMPACT : PRETTY).toJson(root));
+        });
     }
 
     /** Writes anything pending and waits (briefly) for the background writer. Call on game exit. */
@@ -448,21 +500,38 @@ public final class Session {
     private void sanitize() {
         if (history == null) history = new ArrayList<>();
         if (widgets == null) widgets = new LinkedHashMap<>();
-        history.removeIf(e -> e == null || e.kind == null || e.who == null || e.amount < 0);
+        history.removeIf(e -> e == null || e.kind == null || e.who == null || e.amount < 0 || e.tax < 0);
         widgets.values().removeIf(c -> c == null);
         if (!(scale >= 0.5f && scale <= 3.0f)) scale = 1.0f;
         for (WidgetCfg c : widgets.values()) {
             if (!(c.scale >= 0.4f && c.scale <= 4.0f)) c.scale = 1.0f;
-            if (!(c.bg >= 0.1f && c.bg <= 1.0f)) c.bg = 1.0f;
+            if (c.bgAlpha < 0 || c.bgAlpha > 100) c.bgAlpha = 100;
+            c.accent &= 0xFFFFFF;
         }
-        if (theme == null || Theme.find(theme) == null) theme = "default";
-        if (moneyDecimals < 0 || moneyDecimals > 3) moneyDecimals = 2;
-        if (musicSource == null || !(musicSource.equals("system") || musicSource.equals("spotify"))) musicSource = "system";
-        if (musicApp == null) musicApp = "";
+        chatWidth = Math.max(140, Math.min(520, chatWidth));
+        chatHeight = Math.max(50, Math.min(400, chatHeight));
+        chatMaxLines = Math.max(0, Math.min(12, chatMaxLines));
+        chatFadeSec = Math.max(0, Math.min(600, chatFadeSec));
+        chatLineGap = Math.max(0, Math.min(4, chatLineGap));
+        if (chatTextColor < 0 || chatTextColor > 4) chatTextColor = 0;
         if (lossLimit < 0) lossLimit = 0;
         if (goal < 0) goal = 0;
         if (tiltAlert != 0 && (tiltAlert < 2 || tiltAlert > 20)) tiltAlert = 0;
         if (!(rakebackPct >= 0 && rakebackPct <= 50)) rakebackPct = 0;
+    }
+
+    /** Appends one line to <game dir>/donutstreamer/sessions.log (summary of a finished session). */
+    public void logSessionEnd(String why, String summary) {
+        String line = Instant.now() + " [" + why + "] " + summary + "\n";
+        Path p = csvPath().resolveSibling("sessions.log");
+        submit(() -> {
+            try {
+                Files.createDirectories(p.getParent());
+                Files.writeString(p, line, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            } catch (IOException e) {
+                LOG.warn("Could not write sessions.log", e);
+            }
+        });
     }
 
     /** Queues a row for <game dir>/donutstreamer/bets.csv (written on the background thread). */
